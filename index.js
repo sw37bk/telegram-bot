@@ -10,10 +10,15 @@ const app = express();
 
 app.use(express.json());
 
-// Хранилище: username/phone -> telegramId
-const userLinks = new Map();
+// Хранилище: token -> {userId, username, phone, expires}
+const linkTokens = new Map();
 // Хранилище: telegramId -> {username, phone, userId}
 const telegramUsers = new Map();
+
+// Генерация уникального токена
+function generateLinkToken() {
+  return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+}
 
 // Webhook для Telegram
 app.post(`/webhook/${token}`, (req, res) => {
@@ -25,11 +30,18 @@ app.post(`/webhook/${token}`, (req, res) => {
 app.post('/api/link-user', (req, res) => {
   const { userId, username, phone } = req.body;
   
-  // Сохраняем запрос на связывание
-  const linkKey = username || phone;
-  userLinks.set(linkKey, { userId, username, phone, linked: false });
+  // Генерируем уникальный токен
+  const token = generateLinkToken();
+  const expires = Date.now() + 10 * 60 * 1000; // 10 минут
   
-  res.json({ success: true, message: 'Теперь напишите боту /start в Telegram' });
+  linkTokens.set(token, { userId, username, phone, expires });
+  
+  res.json({ 
+    success: true, 
+    token,
+    botUrl: `https://t.me/${process.env.BOT_USERNAME}?start=${token}`,
+    message: `Перейдите по ссылке или напишите боту команду: /start ${token}`
+  });
 });
 
 // API для отправки уведомлений пользователю
@@ -73,28 +85,38 @@ app.get('/api/link-status/:userId', (req, res) => {
   res.json({ linked: false });
 });
 
-// Обработка команды /start
-bot.onText(/\/start/, (msg) => {
+// Обработка команды /start с токеном
+bot.onText(/\/start(?:\s+(.+))?/, (msg, match) => {
   const chatId = msg.chat.id;
   const telegramUsername = msg.from.username;
   const firstName = msg.from.first_name;
+  const token = match[1];
   
-  // Ищем запрос на связывание по username или имени
-  let linkData = null;
-  const searchKeys = [
-    telegramUsername ? `@${telegramUsername}` : null,
-    telegramUsername,
-    firstName
-  ].filter(Boolean);
-  
-  for (const key of searchKeys) {
-    if (userLinks.has(key)) {
-      linkData = userLinks.get(key);
-      break;
+  if (token) {
+    // Проверяем токен
+    const linkData = linkTokens.get(token);
+    
+    if (!linkData) {
+      // Отправляем webhook об ошибке
+      fetch('https://rental-crm-frontend-po2rt7ktx-sw37bks-projects.vercel.app/api/telegram-link-callback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ success: false, error: 'invalid_token' })
+      }).catch(console.error);
+      return bot.sendMessage(chatId, '❌ Неверный или устаревший токен связывания');
     }
-  }
-  
-  if (linkData) {
+    
+    if (linkData.expires < Date.now()) {
+      linkTokens.delete(token);
+      // Отправляем webhook об ошибке
+      fetch('https://rental-crm-frontend-po2rt7ktx-sw37bks-projects.vercel.app/api/telegram-link-callback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ success: false, error: 'token_expired' })
+      }).catch(console.error);
+      return bot.sendMessage(chatId, '❌ Токен связывания истек. Получите новый на сайте');
+    }
+    
     // Связываем аккаунты
     telegramUsers.set(chatId.toString(), {
       userId: linkData.userId,
@@ -104,8 +126,23 @@ bot.onText(/\/start/, (msg) => {
       firstName: firstName
     });
     
-    // Помечаем как связанный
-    linkData.linked = true;
+    // Удаляем использованный токен
+    linkTokens.delete(token);
+    
+    // Отправляем webhook на сайт об успешном связывании
+    fetch('https://rental-crm-frontend-po2rt7ktx-sw37bks-projects.vercel.app/api/telegram-link-callback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        success: true,
+        userId: linkData.userId,
+        telegramId: chatId.toString(),
+        username: linkData.username,
+        phone: linkData.phone,
+        telegramUsername: telegramUsername,
+        firstName: firstName
+      })
+    }).catch(console.error);
     
     bot.sendMessage(chatId, `✅ Аккаунт успешно привязан к Рентология!
     
@@ -120,15 +157,18 @@ ${telegramUsername ? `Telegram: @${telegramUsername}` : `Имя: ${firstName}`}
     
     console.log(`User linked: ${linkData.userId} -> ${chatId}`);
   } else {
+    // Проверяем, не привязан ли уже
+    const userData = telegramUsers.get(chatId.toString());
+    if (userData) {
+      return bot.sendMessage(chatId, `✅ Ваш аккаунт уже привязан (ID: ${userData.userId})`);
+    }
+    
     bot.sendMessage(chatId, `🏠 Добро пожаловать в Рентология!
 
-❌ Аккаунт не найден для связывания.
-
-Для связывания аккаунта:
+❌ Для связывания аккаунта:
 1. Зайдите в настройки на сайте
-2. Введите ваш Telegram никнейм: ${telegramUsername ? `@${telegramUsername}` : 'укажите никнейм'}
-3. Нажмите "Связать аккаунт"
-4. Вернитесь сюда и напишите /start снова`);
+2. Нажмите "Связать Telegram"
+3. Перейдите по полученной ссылке или используйте токен`);
   }
 });
 
@@ -156,12 +196,22 @@ Telegram: ${userData.telegramUsername ? `@${userData.telegramUsername}` : userDa
   }
 });
 
+// Очистка истекших токенов
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, data] of linkTokens.entries()) {
+    if (data.expires < now) {
+      linkTokens.delete(token);
+    }
+  }
+}, 60000); // каждую минуту
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     linkedUsers: telegramUsers.size,
-    pendingLinks: userLinks.size
+    pendingTokens: linkTokens.size
   });
 });
 
