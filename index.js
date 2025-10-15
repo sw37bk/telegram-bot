@@ -20,11 +20,11 @@ app.post(`/webhook/${token}`, (req, res) => {
   res.sendStatus(200);
 });
 
-// API для отправки уведомлений по email
-app.post('/api/notify-by-email', (req, res) => {
-  const { email, message } = req.body;
+// API для отправки уведомлений по username/имени
+app.post('/api/notify-by-username', (req, res) => {
+  const { username, message } = req.body;
   
-  const telegramId = users.get(email);
+  const telegramId = users.get(username);
   if (!telegramId) {
     return res.status(404).json({ error: 'User not found or not linked' });
   }
@@ -45,8 +45,8 @@ app.post('/api/notify-user', (req, res) => {
 
 // API для получения списка пользователей
 app.get('/api/users', (req, res) => {
-  const userList = Array.from(users.entries()).map(([email, telegramId]) => ({
-    email,
+  const userList = Array.from(users.entries()).map(([username, telegramId]) => ({
+    username,
     telegramId,
     linked: true
   }));
@@ -54,51 +54,59 @@ app.get('/api/users', (req, res) => {
 });
 
 // API для проверки привязки пользователя
-app.get('/api/user/:email', (req, res) => {
-  const { email } = req.params;
-  const telegramId = users.get(email);
+app.get('/api/user/:username', (req, res) => {
+  const { username } = req.params;
+  const telegramId = users.get(username);
   
   if (telegramId) {
-    res.json({ email, telegramId, linked: true });
+    res.json({ username, telegramId, linked: true });
   } else {
-    res.json({ email, linked: false });
+    res.json({ username, linked: false });
   }
 });
 
 // Обработка команды /start
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
+  const username = msg.from.username;
+  const firstName = msg.from.first_name;
+  
+  // Автоматически привязываем пользователя по username или имени
+  const userKey = username ? `@${username}` : firstName;
+  users.set(userKey, chatId.toString());
+  
   const welcomeMessage = `
-🤖 Добро пожаловать в RentalCRM Bot!
+🏠 Добро пожаловать в Рентология!
 
-Для связывания аккаунта отправьте команду:
-/link ваш@email.com
+✅ Ваш аккаунт автоматически привязан!
+${username ? `Никнейм: @${username}` : `Имя: ${firstName}`}
 
-Например: /link user@example.com
+Вы будете получать уведомления о:
+• Новых бронированиях
+• Отменах бронирований
+• Новых сообщениях в чатах
+
+Используйте /help для просмотра команд.
   `;
   
   bot.sendMessage(chatId, welcomeMessage);
+  console.log(`User auto-linked: ${userKey} -> ${chatId}`);
 });
 
-// Обработка команды /link
+// Обработка команды /link для ручной привязки
 bot.onText(/\/link (.+)/, (msg, match) => {
   const chatId = msg.chat.id;
-  const email = match[1];
+  const userKey = match[1];
   
-  if (!email.includes('@')) {
-    bot.sendMessage(chatId, '❌ Неверный формат email');
-    return;
-  }
+  users.set(userKey, chatId.toString());
   
-  users.set(email, chatId.toString());
-  
-  bot.sendMessage(chatId, `✅ Аккаунт ${email} успешно привязан!
+  bot.sendMessage(chatId, `✅ Аккаунт ${userKey} успешно привязан!
 Теперь вы будете получать уведомления о:
 • Новых бронированиях
 • Отменах бронирований  
 • Новых сообщениях в чатах`);
 
-  console.log(`User linked: ${email} -> ${chatId}`);
+  console.log(`User manually linked: ${userKey} -> ${chatId}`);
 });
 
 // Обработка команды /help
@@ -107,8 +115,8 @@ bot.onText(/\/help/, (msg) => {
   const helpMessage = `
 📋 Доступные команды:
 
-/start - Начать работу с ботом
-/link email - Привязать аккаунт
+/start - Начать работу и привязать аккаунт
+/link username - Ручная привязка аккаунта
 /help - Показать эту справку
 /status - Проверить статус привязки
   `;
@@ -120,19 +128,19 @@ bot.onText(/\/help/, (msg) => {
 bot.onText(/\/status/, (msg) => {
   const chatId = msg.chat.id;
   
-  // Ищем email по chat ID
-  let userEmail = null;
-  for (const [email, id] of users.entries()) {
+  // Ищем username по chat ID
+  let userKey = null;
+  for (const [key, id] of users.entries()) {
     if (id === chatId.toString()) {
-      userEmail = email;
+      userKey = key;
       break;
     }
   }
   
-  if (userEmail) {
-    bot.sendMessage(chatId, `✅ Аккаунт привязан: ${userEmail}`);
+  if (userKey) {
+    bot.sendMessage(chatId, `✅ Аккаунт привязан: ${userKey}`);
   } else {
-    bot.sendMessage(chatId, `❌ Аккаунт не привязан. Используйте /link ваш@email.com`);
+    bot.sendMessage(chatId, `❌ Аккаунт не привязан. Используйте /start для автоматической привязки`);
   }
 });
 
